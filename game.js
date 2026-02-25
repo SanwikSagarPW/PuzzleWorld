@@ -89,6 +89,13 @@ class Game {
         this.canvas = document.getElementById('game-canvas');
         this.ctx = this.canvas.getContext('2d');
         this.currentLevel = 1;
+        
+        // Analytics tracking variables
+        this.currentLevelId = null;
+        this.levelStartTime = 0;
+        this.taskCounter = 0;
+        this.moveStartTime = 0;
+        
         this.reset();
         this.setupControls();
         this.loadLevel(this.currentLevel);
@@ -105,6 +112,8 @@ class Game {
         this.collectedItems = new Set();
         this.moves = 0;
         this.gameWon = false;
+        this.taskCounter = 0;
+        this.moveStartTime = Date.now();
     }
 
     loadLevel(levelNum) {
@@ -138,6 +147,15 @@ class Game {
                     this.collectibles.push({ x, y, id: `${x}-${y}` });
                 }
             }
+        }
+
+        // Analytics: Start level tracking
+        if (window.gameAnalytics) {
+            this.currentLevelId = 'campaign_level_' + levelNum;
+            window.gameAnalytics.startLevel(this.currentLevelId);
+            this.levelStartTime = Date.now();
+            this.taskCounter = 0;
+            console.log('[Analytics] Level started:', this.currentLevelId);
         }
 
         this.updateUI();
@@ -311,8 +329,42 @@ class Game {
 
         // Check for collectible
         const collectibleId = `${newX}-${newY}`;
-        if (this.map[newY][newX] === 'C' && !this.collectedItems.has(collectibleId)) {
+        const foundCollectible = this.map[newY][newX] === 'C' && !this.collectedItems.has(collectibleId);
+        
+        if (foundCollectible) {
             this.collectedItems.add(collectibleId);
+        }
+
+        // Analytics: Record this move as a task
+        if (window.gameAnalytics && this.currentLevelId) {
+            const moveTime = Date.now() - this.moveStartTime;
+            this.taskCounter++;
+            
+            const taskId = 'move_' + this.taskCounter;
+            const question = foundCollectible ? 'collectible_found' : 'move_action';
+            const position = `pos_${newX}_${newY}`;
+            
+            // Record the move task
+            window.gameAnalytics.recordTask(
+                this.currentLevelId,
+                taskId,
+                question,
+                position,
+                position,
+                moveTime,
+                foundCollectible ? 10 : 0
+            );
+            
+            // Update metrics
+            window.gameAnalytics.addRawMetric('moves', this.moves);
+            window.gameAnalytics.addRawMetric('collectibles_collected', this.collectedItems.size);
+            window.gameAnalytics.addRawMetric('collectibles_total', this.collectibles.length);
+            const accuracy = this.collectibles.length > 0 ? 
+                (this.collectedItems.size / this.collectibles.length * 100).toFixed(1) : 0;
+            window.gameAnalytics.addRawMetric('collection_progress_percent', accuracy);
+            
+            // Reset move timer
+            this.moveStartTime = Date.now();
         }
 
         this.updateUI();
@@ -476,6 +528,36 @@ class Game {
         document.getElementById('final-moves').textContent = this.moves;
         document.getElementById('final-score').textContent = score;
         
+        // Analytics: Track level completion
+        if (window.gameAnalytics && this.currentLevelId) {
+            const timeTaken = Date.now() - this.levelStartTime;
+            
+            // Calculate XP based on performance
+            const baseXP = 100;
+            const moveBonus = Math.max(0, 100 - this.moves); // Bonus for fewer moves
+            const timeBonus = Math.max(0, 50 - Math.floor(timeTaken / 1000)); // Time bonus
+            const totalXP = baseXP + moveBonus + timeBonus;
+            
+            console.log('[Analytics] Level completed!', {
+                timeTaken: (timeTaken / 1000).toFixed(2) + 's',
+                moves: this.moves,
+                baseXP: baseXP,
+                moveBonus: moveBonus,
+                timeBonus: timeBonus,
+                totalXP: totalXP
+            });
+            
+            // End level tracking
+            window.gameAnalytics.endLevel(this.currentLevelId, true, timeTaken, totalXP);
+            
+            // Add final metrics
+            window.gameAnalytics.addRawMetric('final_score', score);
+            window.gameAnalytics.addRawMetric('level_number', this.currentLevel);
+            
+            // Submit the report
+            window.gameAnalytics.submitReport();
+        }
+        
         const winScreen = document.getElementById('win-screen');
         winScreen.style.display = 'flex';
         // Trigger reflow
@@ -494,5 +576,25 @@ class Game {
 
 // Initialize game when DOM is loaded
 document.addEventListener('DOMContentLoaded', () => {
+    // ============================================
+    // ANALYTICS SETUP
+    // ============================================
+    window.gameAnalytics = new AnalyticsManager();
+    const sessionName = 'session_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);
+    window.gameAnalytics.initialize('NebulaMaze', sessionName);
+    
     const game = new Game();
+    
+    // Track abandoned sessions (when user leaves before completing)
+    window.addEventListener('beforeunload', () => {
+        if (game.currentLevelId && game.levelStartTime > 0 && !game.gameWon) {
+            const level = window.gameAnalytics._getLevelById(game.currentLevelId);
+            if (level && !level.successful) {
+                const timeTaken = Date.now() - game.levelStartTime;
+                window.gameAnalytics.endLevel(game.currentLevelId, false, timeTaken, 0);
+                window.gameAnalytics.submitReport();
+                console.log('[Analytics] Session ended (incomplete)');
+            }
+        }
+    });
 });
